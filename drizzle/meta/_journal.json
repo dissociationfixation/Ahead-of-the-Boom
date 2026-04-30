@@ -1,5 +1,13 @@
 {
   "version": "7",
   "dialect": "mysql",
-  "entries": []
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1777566096353,
+      "tag": "0000_cultured_the_watchers",
+      "breakpoints": true
+    }
+  ]
 }

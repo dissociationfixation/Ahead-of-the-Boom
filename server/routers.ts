@@ -2,9 +2,9 @@ import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
+import { z } from "zod";
 
 export const appRouter = router({
-    // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
   system: systemRouter,
   auth: router({
     me: publicProcedure.query(opts => opts.ctx.user),
@@ -17,12 +17,69 @@ export const appRouter = router({
     }),
   }),
 
-  // TODO: add feature routers here, e.g.
-  // todo: router({
-  //   list: protectedProcedure.query(({ ctx }) =>
-  //     db.getUserTodos(ctx.user.id)
-  //   ),
-  // }),
+  newsletter: router({
+    subscribe: publicProcedure
+      .input(z.object({ email: z.string().email() }))
+      .mutation(async ({ input }) => {
+        const resendApiKey = process.env.RESEND_API_KEY;
+        const audienceId = process.env.RESEND_AUDIENCE_ID;
+
+        if (!resendApiKey || !audienceId) {
+          throw new Error("Resend API configuration missing");
+        }
+
+        const response = await fetch(
+          `https://api.resend.com/audiences/${audienceId}/contacts`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${resendApiKey}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              email: input.email,
+            }),
+          }
+        );
+
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.message || "Failed to subscribe");
+        }
+
+        return { success: true };
+      }),
+
+    getSubscriberCount: publicProcedure.query(async () => {
+      const resendApiKey = process.env.RESEND_API_KEY;
+      const audienceId = process.env.RESEND_AUDIENCE_ID;
+
+      if (!resendApiKey || !audienceId) {
+        return { count: 0 };
+      }
+
+      try {
+        const response = await fetch(
+          `https://api.resend.com/audiences/${audienceId}`,
+          {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${resendApiKey}`,
+            },
+          }
+        );
+
+        if (!response.ok) {
+          return { count: 0 };
+        }
+
+        const data = await response.json();
+        return { count: data.contacts_count || 0 };
+      } catch (error) {
+        return { count: 0 };
+      }
+    }),
+  }),
 });
 
 export type AppRouter = typeof appRouter;
