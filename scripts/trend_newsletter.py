@@ -4,16 +4,18 @@ Ahead of the Boom - Automated Trend Newsletter Engine
 
 This script:
 1. Scrapes trending GitHub repositories using BeautifulSoup
-2. Synthesizes trends using OpenAI GPT-4o-mini
-3. Generates HTML newsletter
-4. Distributes via Resend API to all subscribers
+2. Scrapes top Reddit posts (when Reddit app is approved)
+3. Synthesizes trends using OpenAI GPT-4o-mini
+4. Generates HTML newsletter
+5. Distributes via Resend SDK to all subscribers
 
 Environment variables required:
 - OPENAI_API_KEY: OpenAI API key for GPT-4o-mini
 - RESEND_API_KEY: Resend API key for email distribution
 - RESEND_AUDIENCE_ID: Resend Audience ID for subscribers
-- REDDIT_CLIENT_ID: Reddit API client ID (optional, for future Reddit scraping)
-- REDDIT_CLIENT_SECRET: Reddit API client secret (optional, for future Reddit scraping)
+- REDDIT_CLIENT_ID: Reddit API client ID (optional, for Reddit scraping)
+- REDDIT_CLIENT_SECRET: Reddit API client secret (optional, for Reddit scraping)
+- REDDIT_USER_AGENT: Reddit user agent string (optional, default: TrendNewsletterBot/1.0)
 """
 
 import os
@@ -24,6 +26,14 @@ from datetime import datetime
 from typing import Optional, Dict, List, Any
 import requests
 from bs4 import BeautifulSoup
+
+# Try to import Resend SDK, fall back to requests if not available
+try:
+    from resend import Resend
+    RESEND_SDK_AVAILABLE = True
+except ImportError:
+    RESEND_SDK_AVAILABLE = False
+    logging.warning("Resend SDK not available. Install with: pip install resend")
 
 # Configure logging
 logging.basicConfig(
@@ -114,6 +124,114 @@ class GitHubTrendingScraper:
             return []
 
 
+class RedditScraper:
+    """Scrapes top Rising posts from Reddit (requires OAuth2 approval)"""
+
+    def __init__(self, client_id: str, client_secret: str, user_agent: str):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.user_agent = user_agent
+        self.base_url = "https://oauth.reddit.com"
+
+    def get_access_token(self) -> Optional[str]:
+        """
+        Authenticate with Reddit OAuth2 and get access token
+
+        Returns:
+            Access token or None if authentication fails
+        """
+        try:
+            auth = (self.client_id, self.client_secret)
+            headers = {"User-Agent": self.user_agent}
+            data = {"grant_type": "client_credentials"}
+
+            response = requests.post(
+                "https://www.reddit.com/api/v1/access_token",
+                auth=auth,
+                headers=headers,
+                data=data,
+                timeout=10,
+            )
+            response.raise_for_status()
+
+            result = response.json()
+            token = result.get("access_token")
+            logger.info("Successfully authenticated with Reddit API")
+            return token
+
+        except Exception as e:
+            logger.error(f"Error authenticating with Reddit: {e}")
+            return None
+
+    def scrape_rising_posts(self, subreddit: str, token: str) -> List[Dict[str, str]]:
+        """
+        Scrape top 5 Rising posts from a subreddit
+
+        Args:
+            subreddit: Subreddit name (e.g., 'technology')
+            token: Reddit OAuth2 access token
+
+        Returns:
+            List of dicts with keys: title, url, score, subreddit
+        """
+        try:
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "User-Agent": self.user_agent,
+            }
+
+            url = f"{self.base_url}/r/{subreddit}/rising"
+            params = {"limit": 5}
+
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response.raise_for_status()
+
+            data = response.json()
+            posts = []
+
+            for post in data.get("data", {}).get("children", []):
+                try:
+                    post_data = post.get("data", {})
+                    posts.append({
+                        "title": post_data.get("title", ""),
+                        "url": f"https://reddit.com{post_data.get('permalink', '')}",
+                        "score": post_data.get("score", 0),
+                        "subreddit": post_data.get("subreddit", ""),
+                    })
+                except Exception as e:
+                    logger.warning(f"Error parsing Reddit post: {e}")
+                    continue
+
+            logger.info(f"Scraped {len(posts)} rising posts from r/{subreddit}")
+            return posts
+
+        except Exception as e:
+            logger.error(f"Error scraping Reddit r/{subreddit}: {e}")
+            return []
+
+    def scrape_multiple_subreddits(self, subreddits: List[str]) -> List[Dict[str, str]]:
+        """
+        Scrape rising posts from multiple subreddits
+
+        Args:
+            subreddits: List of subreddit names
+
+        Returns:
+            Combined list of posts from all subreddits
+        """
+        token = self.get_access_token()
+        if not token:
+            logger.error("Failed to get Reddit access token")
+            return []
+
+        all_posts = []
+        for subreddit in subreddits:
+            posts = self.scrape_rising_posts(subreddit, token)
+            all_posts.extend(posts)
+
+        return all_posts[:5]  # Return top 5 combined
+
+
 class TrendForecaster:
     """Uses OpenAI to synthesize trends from scraped data"""
 
@@ -121,12 +239,17 @@ class TrendForecaster:
         self.api_key = api_key
         self.base_url = "https://api.openai.com/v1"
 
-    def synthesize_trends(self, github_repos: List[Dict[str, str]]) -> Optional[str]:
+    def synthesize_trends(
+        self,
+        github_repos: List[Dict[str, str]],
+        reddit_posts: Optional[List[Dict[str, str]]] = None,
+    ) -> Optional[str]:
         """
         Use GPT-4o-mini to synthesize trends into HTML newsletter
 
         Args:
             github_repos: List of trending GitHub repositories
+            reddit_posts: Optional list of trending Reddit posts
 
         Returns:
             HTML newsletter content or None if synthesis fails
@@ -141,6 +264,12 @@ class TrendForecaster:
             context += f"{i}. {repo['name']} ({repo['stars']})\n"
             context += f"   URL: {repo['url']}\n"
             context += f"   Description: {repo['description']}\n\n"
+
+        if reddit_posts:
+            context += "\nTrending Reddit Discussions:\n\n"
+            for i, post in enumerate(reddit_posts, 1):
+                context += f"{i}. r/{post['subreddit']}: {post['title']}\n"
+                context += f"   Score: {post['score']} | URL: {post['url']}\n\n"
 
         system_prompt = """You are a Trend Forecaster AI. Your job is to analyze emerging technology trends and synthesize them into compelling, actionable insights for tech professionals.
 
@@ -198,32 +327,29 @@ Create a compelling 400-word HTML newsletter identifying this macro-trend with 3
 
 
 class ResendDistributor:
-    """Distributes HTML newsletter via Resend API"""
+    """Distributes HTML newsletter via Resend API or SDK"""
 
     def __init__(self, api_key: str, audience_id: str):
         self.api_key = api_key
         self.audience_id = audience_id
         self.base_url = "https://api.resend.com"
+        
+        # Initialize Resend SDK if available
+        if RESEND_SDK_AVAILABLE:
+            self.client = Resend(api_key=api_key)
+        else:
+            self.client = None
 
     def get_audience_contacts(self) -> List[str]:
         """Fetch all email addresses from Resend Audience"""
         try:
             response = requests.get(
-                f"{self.base_url}/audiences/{self.audience_id}",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=10,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            # Fetch contacts list
-            contacts_response = requests.get(
                 f"{self.base_url}/audiences/{self.audience_id}/contacts",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 timeout=10,
             )
-            contacts_response.raise_for_status()
-            contacts_data = contacts_response.json()
+            response.raise_for_status()
+            contacts_data = response.json()
 
             emails = [contact["email"] for contact in contacts_data.get("data", [])]
             logger.info(f"Fetched {len(emails)} subscriber emails from Resend")
@@ -280,26 +406,38 @@ class ResendDistributor:
         """
 
         try:
-            # Send to audience via Resend batch API
-            response = requests.post(
-                f"{self.base_url}/emails",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
+            # Use Resend SDK if available
+            if self.client:
+                logger.info("Sending via Resend SDK")
+                response = self.client.emails.send({
                     "from": "trends@aheadoftheboom.com",
                     "to": emails,
                     "subject": "🚀 This Week's Emerging Macro-Trend",
                     "html": email_template,
-                },
-                timeout=30,
-            )
+                })
+                logger.info(f"Successfully sent newsletter via SDK to {len(emails)} subscribers")
+                return True
+            else:
+                # Fall back to HTTP API
+                logger.info("Sending via Resend HTTP API")
+                response = requests.post(
+                    f"{self.base_url}/emails",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "from": "trends@aheadoftheboom.com",
+                        "to": emails,
+                        "subject": "🚀 This Week's Emerging Macro-Trend",
+                        "html": email_template,
+                    },
+                    timeout=30,
+                )
 
-            response.raise_for_status()
-            result = response.json()
-            logger.info(f"Successfully sent newsletter to {len(emails)} subscribers")
-            return True
+                response.raise_for_status()
+                logger.info(f"Successfully sent newsletter via API to {len(emails)} subscribers")
+                return True
 
         except Exception as e:
             logger.error(f"Error sending newsletter: {e}")
@@ -329,10 +467,24 @@ def main():
 
     logger.info(f"Found {len(github_repos)} trending repositories")
 
-    # Step 2: Synthesize trends with AI
-    logger.info("Step 2: Synthesizing trends with GPT-4o-mini...")
+    # Step 2: Scrape Reddit (optional, requires app approval)
+    reddit_posts = []
+    reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
+    reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
+    reddit_user_agent = os.getenv("REDDIT_USER_AGENT", "TrendNewsletterBot/1.0")
+
+    if reddit_client_id and reddit_client_secret:
+        logger.info("Step 2: Scraping Reddit trending posts...")
+        reddit_scraper = RedditScraper(reddit_client_id, reddit_client_secret, reddit_user_agent)
+        reddit_posts = reddit_scraper.scrape_multiple_subreddits(["technology", "Entrepreneur"])
+        logger.info(f"Found {len(reddit_posts)} trending Reddit posts")
+    else:
+        logger.info("Step 2: Skipping Reddit scraping (credentials not configured)")
+
+    # Step 3: Synthesize trends with AI
+    logger.info("Step 3: Synthesizing trends with GPT-4o-mini...")
     forecaster = TrendForecaster(openai_key)
-    html_newsletter = forecaster.synthesize_trends(github_repos)
+    html_newsletter = forecaster.synthesize_trends(github_repos, reddit_posts if reddit_posts else None)
 
     if not html_newsletter:
         logger.error("Failed to synthesize trends")
@@ -340,8 +492,8 @@ def main():
 
     logger.info("Successfully generated HTML newsletter")
 
-    # Step 3: Distribute via Resend
-    logger.info("Step 3: Distributing newsletter via Resend...")
+    # Step 4: Distribute via Resend
+    logger.info("Step 4: Distributing newsletter via Resend...")
     distributor = ResendDistributor(resend_key, audience_id)
     emails = distributor.get_audience_contacts()
 
